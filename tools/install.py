@@ -35,6 +35,11 @@ import push_data
 DEVELOPER_HELP = 'https://developers.meta.com/horizon/documentation/android-apps/enable-developer-mode/'
 GIB = 1024 ** 3
 DISC_EXTENSIONS = {'.iso', '.rvz', '.wbfs', '.gcz', '.wia', '.ciso'}
+# Standalone Android VR headsets GalaxyQuest is known to run on, matched against
+# ro.product.manufacturer and ro.product.brand (lowercase, without spaces,
+# hyphens or underscores). Meta: Quest 2/3/3S. Play For Dream MR reports
+# manufacturer 'Play For Dream', brand 'YVR', model 'PFDM MR'.
+KNOWN_HEADSET_VENDORS = {'oculus', 'meta', 'playfordream', 'yvr'}
 
 
 class InstallError(Exception):
@@ -229,7 +234,22 @@ def free_device_bytes(adb, serial):
     raise InstallError('Could not check the headset storage. Reconnect it and try again.\n' + output)
 
 
-def install_game(game, selected, movies, status):
+def normalized(value):
+    return ''.join(character for character in value.lower() if character.isalnum())
+
+
+def headset_identity(adb, serial):
+    """Return (manufacturer, brand, model) exactly as the device reports them."""
+    return tuple(run_adb(adb, 'shell', 'getprop ' + prop, serial=serial)
+                 for prop in ('ro.product.manufacturer', 'ro.product.brand', 'ro.product.model'))
+
+
+def is_known_headset(manufacturer, brand='', model=''):
+    names = {normalized(manufacturer), normalized(brand)}
+    return bool(names & KNOWN_HEADSET_VENDORS) or normalized(model).startswith(('pfdm', 'playfordream'))
+
+
+def install_game(game, selected, movies, status, confirm=None):
     """All heavy work runs off the UI thread; errors stop before copying bad data."""
     source, is_image = game_copy(game)
     if is_image:
@@ -239,11 +259,17 @@ def install_game(game, selected, movies, status):
     status('Checking headset and storage...', 2)
     serial = choose_device(list_devices(adb), selected)
     # Prevent accidentally installing to an Android phone listed by adb.
-    manufacturer = run_adb(adb, 'shell', 'getprop ro.product.manufacturer', serial=serial).lower()
-    model = run_adb(adb, 'shell', 'getprop ro.product.model', serial=serial)
-    if manufacturer not in ('oculus', 'meta'):
-        raise InstallError('The selected device is %s (%s), not a Meta headset. '
-                           'Disconnect other Android devices and select your headset.' % (model, manufacturer))
+    # Known headsets pass silently; any other device needs the user's confirmation.
+    manufacturer, brand, model = headset_identity(adb, serial)
+    print('Device: manufacturer=%r brand=%r model=%r serial=%s' % (manufacturer, brand, model, serial), flush=True)
+    if not is_known_headset(manufacturer, brand, model):
+        question = ('The selected device is %s (%s), which is not a headset this installer knows. '
+                    'GalaxyQuest needs a standalone Android VR headset with OpenXR. '
+                    'Install on this device anyway?' % (model, manufacturer))
+        if not (confirm and confirm(question)):
+            raise InstallError('The selected device is %s (%s), not a supported headset. '
+                               'Disconnect other Android devices and select your headset.' % (model, manufacturer))
+        print('Unknown device confirmed by the user.', flush=True)
     print('Headset: %s (%s)' % (model, serial), flush=True)
     if free_device_bytes(adb, serial) < (7 if movies else 3) * GIB:
         raise InstallError('Free at least %d GB on the headset and try again.' % (7 if movies else 3))
@@ -282,7 +308,7 @@ def install_game(game, selected, movies, status):
 
         push_data.copy_data(str(cooked), adb=adb, serial=serial,
                             progress=copying, temp_dir=str(scratch))
-    status('Installed! Open GalaxyQuest in Library > Unknown Sources on your headset.', 100)
+    status('Installed! Open GalaxyQuest on your headset (Quest: Library > Unknown Sources).', 100)
 
 
 def self_test():
@@ -304,13 +330,14 @@ def self_test():
 
 
 class Installer:
-    def __init__(self, root):
+    def __init__(self, root, allow_unknown_headset=False):
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
         self.tk, self.ttk = tk, ttk
         self.filedialog, self.messagebox = filedialog, messagebox
         self.root, self.events = root, queue.Queue()
         self.busy = False
+        self.allow_unknown_headset = allow_unknown_headset
         root.title('GalaxyQuest installer')
         root.geometry('760x560')
         root.minsize(650, 510)
@@ -407,7 +434,8 @@ class Installer:
                           (sys.version, folder, movies), flush=True)
                     try:
                         install_game(folder, selected, movies,
-                                     lambda text, percent: self.events.put(('progress', text, percent)))
+                                     lambda text, percent: self.events.put(('progress', text, percent)),
+                                     confirm=self.confirm)
                     except BaseException:
                         traceback.print_exc()
                         raise
@@ -417,6 +445,15 @@ class Installer:
             if isinstance(error, subprocess.CalledProcessError):
                 detail = error.output or detail
             self.events.put(('error', detail, str(log_path) if log_path else 'Could not create a log.'))
+
+    def confirm(self, question):
+        """Ask from the worker thread; Tk dialogs must run on the UI thread."""
+        if self.allow_unknown_headset:
+            return True
+        answered, answer = threading.Event(), []
+        self.events.put(('confirm', question, answered, answer))
+        answered.wait()
+        return bool(answer and answer[0])
 
     def drain(self):
         try:
@@ -430,6 +467,11 @@ class Installer:
                     if event[1].startswith(('Extracting', 'Preparing', 'Copying', 'Finishing', 'Installing')):
                         self.bar.configure(mode='indeterminate')
                         self.bar.start(20)
+                elif kind == 'confirm':
+                    try:
+                        event[3].append(self.messagebox.askyesno('Unknown device', event[1], icon='warning'))
+                    finally:
+                        event[2].set()
                 elif kind == 'devices':
                     if self.busy:
                         continue
@@ -467,7 +509,7 @@ class Installer:
                         self.messagebox.showerror('Installation stopped', event[1] + '\n\nLog: ' + log_path)
                     else:
                         self.messagebox.showinfo('GalaxyQuest installed',
-                            'Open Library > Unknown Sources > GalaxyQuest on your headset.\n\nLog: ' + log_path)
+                            'Open GalaxyQuest on your headset (Quest: Library > Unknown Sources).\n\nLog: ' + log_path)
         except queue.Empty:
             pass
         self.root.after(100, self.drain)
@@ -485,6 +527,8 @@ def main():
     ap.add_argument('--self-test-report', type=Path, help='write the self-test result to a file (for windowed builds)')
     ap.add_argument('--convert-only', nargs=2, metavar=('GAME', 'OUTPUT'), help='extract and convert without connecting a headset')
     ap.add_argument('--without-movies', action='store_true')
+    ap.add_argument('--allow-unknown-headset', action='store_true',
+                    help='install on Android devices the installer does not recognize without asking')
     args = ap.parse_args()
     if args.self_test:
         try:
@@ -513,7 +557,7 @@ def main():
                                         jobs=min(os.cpu_count() or 1, 8), with_movies=not args.without_movies)
     import tkinter as tk
     root = tk.Tk()
-    Installer(root)
+    Installer(root, allow_unknown_headset=args.allow_unknown_headset)
     root.mainloop()
     return 0
 
